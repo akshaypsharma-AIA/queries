@@ -34,10 +34,6 @@ BEGIN
         IF NOT EXISTS (SELECT 1 FROM odm.enrollment_member)
             THROW 50010, 'odm.enrollment_member is empty. Run slice 1 first.', 1;
 
-        IF NOT EXISTS (SELECT 1 FROM pub.member_benefit_plan_span
-                       WHERE reference_date = @reference_date AND feed_code = @feed_code)
-            THROW 50011, 'pub.member_benefit_plan_span holds nothing for that date and feed. Run slice 1 first.', 1;
-
         UPDATE ctl.load_run
         SET    status_code = 'ABANDONED', finished_at = SYSDATETIME(),
                halt_reason = 'No completion recorded. Session terminated.'
@@ -49,11 +45,6 @@ BEGIN
         SET @first_run = ISNULL((SELECT MAX(run_identifier) FROM ctl.load_run), 0) + 1;
 
         /* ========== empty the targets, children before parents ========== */
-
-        DELETE pub.member_language
-        WHERE  reference_date = @reference_date AND feed_code = @feed_code;
-        DELETE pub.member_other_insurance
-        WHERE  reference_date = @reference_date AND feed_code = @feed_code;
 
         DELETE odm.enrollment_other_insurance;
         DELETE odm.enrollment_compliance_program;
@@ -465,87 +456,6 @@ BEGIN
 
         SET @rows = @@ROWCOUNT;
         EXEC ctl.usp_run_finish @run, @rows;
-
-
-        /* 10  pub.member_language. One language per use per member -- language_code is not in the key. 6 is Written, 7 is Spoken, per Nelson 20 Sep. */
-
-        EXEC ctl.usp_run_start 'pub.member_language', @reference_date, @feed_code, @run OUTPUT;
-
-        INSERT pub.member_language WITH (TABLOCK)
-            (reference_date, feed_code, member_identifier, benefit_plan_identifier,
-             member_benefit_plan_start_date, language_use_indicator, language_code,
-             source_member_version_key, insert_batch_id)
-        SELECT  s.reference_date, s.feed_code, s.member_identifier, s.benefit_plan_identifier,
-                s.member_benefit_plan_start_date,
-                CASE l.language_use WHEN 'SPOKEN' THEN '7' WHEN 'WRITTEN' THEN '6' END,
-                /* the ISO code or nothing. A fragment in LUI02 is worse than an empty one. */
-                NULLIF(LTRIM(RTRIM(x.LANG_X12_CODE)),''),
-                l.source_member_version_key, @run
-        FROM    pub.member_benefit_plan_span s
-        JOIN   (SELECT  member_identifier, language_use, language_code, source_member_version_key,
-                        rn = ROW_NUMBER() OVER (PARTITION BY member_identifier, language_use
-                                                ORDER BY priority, language_code)
-                FROM    odm.enrollment_language) l
-               ON  l.member_identifier = s.member_identifier
-               AND l.rn = 1
-        /* one row per HRP code, not per language -- collapse to one row per description or the join multiplies */
-        LEFT JOIN (SELECT  LANG_DESCRIPTION,
-                           LANG_X12_CODE = MIN(LANG_X12_CODE)
-                   FROM    ODS_FINAL.XWALK.INT_LANGUAGE_XWALK
-                   WHERE   END_DATE > GETDATE()
-                     AND   NULLIF(LTRIM(RTRIM(LANG_X12_CODE)),'') IS NOT NULL
-                   GROUP BY LANG_DESCRIPTION) x
-               ON x.LANG_DESCRIPTION = l.language_code
-        WHERE   s.reference_date = @reference_date AND s.feed_code = @feed_code;
-
-        SET @rows = @@ROWCOUNT;
-        EXEC ctl.usp_run_finish @run, @rows;
-
-
-        /* 11  pub.member_other_insurance. Loop 2320 caps at five repeats, most recent by termination date. NULL is still open so it sorts first. COB01 is P, COB03 is 1. CG p18, TR3 p164. */
-
-        EXEC ctl.usp_run_start 'pub.member_other_insurance', @reference_date, @feed_code, @run OUTPUT;
-
-        INSERT pub.member_other_insurance WITH (TABLOCK)
-            (reference_date, feed_code, member_identifier, benefit_plan_identifier,
-             member_benefit_plan_start_date, carrier_sequence,
-             payer_responsibility_code, cob_policy_identifier, coordination_of_benefits_code,
-             coverage_scope_code, cob_effective_date, cob_termination_date,
-             carrier_name, source_member_version_key, insert_batch_id)
-        SELECT  s.reference_date, s.feed_code, s.member_identifier, s.benefit_plan_identifier,
-                s.member_benefit_plan_start_date, CAST(k.rk AS tinyint),
-                'P', LEFT(CAST(k.cob_policy_identifier AS varchar(50)),50), '1',
-                k.coverage_scope_code, k.effective_date, k.termination_date,
-                LEFT(k.carrier_name,60), k.source_member_version_key, @run
-        FROM    pub.member_benefit_plan_span s
-        JOIN   (SELECT  o.*,
-                        rk = ROW_NUMBER() OVER (
-                               PARTITION BY o.member_identifier
-                               ORDER BY CASE WHEN o.termination_date IS NULL THEN 0 ELSE 1 END,
-                                        o.termination_date DESC,
-                                        o.cob_policy_identifier DESC)
-                FROM    odm.enrollment_other_insurance o) k
-               ON k.member_identifier = s.member_identifier AND k.rk <= 5
-        WHERE   s.reference_date = @reference_date AND s.feed_code = @feed_code;
-
-        SET @rows = @@ROWCOUNT;
-        EXEC ctl.usp_run_finish @run, @rows;
-
-        /* cob_carrier_count must equal the loops we actually published, or it lies */
-        UPDATE  s
-        SET     s.cob_carrier_count = c.n
-        FROM    pub.member_benefit_plan_span s
-        JOIN   (SELECT reference_date, feed_code, member_identifier,
-                       benefit_plan_identifier, member_benefit_plan_start_date, n = COUNT(*)
-                FROM   pub.member_other_insurance
-                WHERE  reference_date = @reference_date AND feed_code = @feed_code
-                GROUP BY reference_date, feed_code, member_identifier,
-                         benefit_plan_identifier, member_benefit_plan_start_date) c
-               ON  c.reference_date = s.reference_date AND c.feed_code = s.feed_code
-               AND c.member_identifier = s.member_identifier
-               AND c.benefit_plan_identifier = s.benefit_plan_identifier
-               AND c.member_benefit_plan_start_date = s.member_benefit_plan_start_date
-        WHERE   s.reference_date = @reference_date AND s.feed_code = @feed_code;
 
     END TRY
     BEGIN CATCH
