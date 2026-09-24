@@ -1,28 +1,16 @@
 USE [ODM];
 
--- A. does the HOSP join multiply?
-SELECT  hosp_rows_per_member = n, members = COUNT(*)
-FROM   (SELECT member_identifier, n = COUNT(*)
-        FROM   odm.enrollment_provider
-        WHERE  provider_relationship = 'Hosp'
-        GROUP BY member_identifier) d
-GROUP BY n ORDER BY n;
+SELECT rows_now = COUNT(*), members_now = COUNT(DISTINCT member_identifier)
+FROM   pub.member_benefit_plan_span
+WHERE  reference_date = '2026-09-01' AND feed_code = 'NORTHBAY_M';
 
--- B. does the PCP join multiply?
-SELECT  pcp_rows_per_member = n, members = COUNT(*)
-FROM   (SELECT member_identifier, n = COUNT(*)
-        FROM   odm.enrollment_provider
-        WHERE  provider_relationship = 'PCP'
-        GROUP BY member_identifier) d
-GROUP BY n ORDER BY n;
+UPDATE cfg.publication_feed
+SET    eligibility_date_source = 'PLAN'
+WHERE  feed_code = 'NORTHBAY_M';
 
--- C. the member in the error
-SELECT  s.benefit_plan_identifier, s.member_benefit_plan_start_date, s.member_benefit_plan_end_date
-FROM    odm.enrollment_benefit_plan_span s
-WHERE   s.member_identifier = '00000856000'
-ORDER BY s.member_benefit_plan_start_date;
+EXEC pub.usp_publish_feed @reference_date = '2026-09-01', @feed_code = 'NORTHBAY_M';
 
-SELECT  provider_relationship, supplier_network_identifier, effective_date, expiration_date
-FROM    odm.enrollment_provider
-WHERE   member_identifier = '00000856000'
-ORDER BY provider_relationship, effective_date;
+SELECT rows_plan = COUNT(*), members_plan = COUNT(DISTINCT member_identifier),
+       per_member = CAST(COUNT(*)*1.0/NULLIF(COUNT(DISTINCT member_identifier),0) AS decimal(9,2))
+FROM   pub.member_benefit_plan_span
+WHERE  reference_date = '2026-09-01' AND feed_code = 'NORTHBAY_M';
