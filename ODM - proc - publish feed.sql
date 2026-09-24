@@ -1,6 +1,3 @@
-/* Publication. Runs per trading partner after slice 1 and slice 2.
-   Run order: usp_load_slice_1 -> usp_load_slice_2 -> usp_publish_feed. */
-
 USE [ODM];
 GO
 SET ANSI_NULLS ON;
@@ -94,14 +91,12 @@ BEGIN
 
         SET @maintenance_type = CASE WHEN @file_type = 'FULL' THEN '030' END;
 
-        /* the look back applies to the END date, so coverage that ended inside the window still goes */
         SET @lookback_from = CASE
               WHEN @lookback_qualifier = 'DAY'   THEN DATEADD(day,   -@lookback_count, @reference_date)
               WHEN @lookback_qualifier = 'MONTH' THEN DATEADD(month, -@lookback_count, @reference_date)
               WHEN @lookback_qualifier = 'YEAR'  THEN DATEADD(year,  -@lookback_count, @reference_date)
               ELSE @reference_date END;
 
-        /* wrap both sides in commas so 'a' cannot match 'at' */
         DECLARE @status_list    varchar(24)  = ',' + REPLACE(ISNULL(@status_filter,''),' ','')      + ',';
         DECLARE @county_list    varchar(204) = ',' + REPLACE(ISNULL(@county_filter,''),' ','')      + ',';
         DECLARE @plan_list      varchar(204) = ',' + REPLACE(ISNULL(@plan_filter,''),' ','')        + ',';
@@ -111,18 +106,12 @@ BEGIN
         DECLARE @hcp_excl_list  varchar(204) = ',' + REPLACE(ISNULL(@excl_hcp,''),' ','')           + ',';
         DECLARE @plan_excl_list varchar(204) = ',' + REPLACE(ISNULL(@excl_plan,''),' ','')          + ',';
 
-
-        /* children before parent */
-
         DELETE pub.member_language
         WHERE  reference_date = @reference_date AND feed_code = @feed_code;
         DELETE pub.member_other_insurance
         WHERE  reference_date = @reference_date AND feed_code = @feed_code;
         DELETE pub.member_benefit_plan_span
         WHERE  reference_date = @reference_date AND feed_code = @feed_code;
-
-
-        /* ---- stage 1, the qualifying population ---- */
 
         EXEC ctl.usp_run_start 'pub.stage.population', @reference_date, @feed_code, @run OUTPUT;
 
@@ -137,7 +126,6 @@ BEGIN
                 ,s.share_of_cost_flag
                 ,s.source_member_version_key
 
-                /* PLAN takes the benefit plan span, anything else takes the matching provider relationship */
                 ,pub_start_date = CASE WHEN @date_source = 'PLAN'
                                        THEN s.member_benefit_plan_start_date
                                        ELSE p.effective_date END
@@ -149,7 +137,6 @@ BEGIN
                                             OR pcp.supplier_location_identifier LIKE 'Pseudo%'
                                            THEN 'Y' ELSE 'N' END
 
-                /* ONLY when the COUNTY PROGRAM is Wellness and Recovery, BOTH when it is also a COMPLIANCE PROGRAM */
                 ,wellrec_scope = CASE
                        WHEN h.county_program_name LIKE '%Wellness and Recovery%' THEN 'ONLY'
                        WHEN cp.member_identifier IS NOT NULL                     THEN 'BOTH'
@@ -160,6 +147,13 @@ BEGIN
                 ,rn = ROW_NUMBER() OVER (PARTITION BY s.member_identifier
                                          ORDER BY s.member_benefit_plan_start_date DESC,
                                                   s.benefit_plan_identifier)
+
+                ,rk = ROW_NUMBER() OVER (
+                        PARTITION BY s.member_identifier, s.benefit_plan_identifier,
+                                     CASE WHEN @date_source = 'PLAN'
+                                          THEN s.member_benefit_plan_start_date
+                                          ELSE p.effective_date END
+                        ORDER BY s.member_benefit_plan_start_date DESC)
         INTO     #pop
         FROM     odm.enrollment_benefit_plan_span s
         JOIN     odm.enrollment_member m
@@ -194,7 +188,7 @@ BEGIN
               AND dup.attribute_name    = 'Duplicate Invalid Record'
 
         WHERE
-              /* a zero day span is a voided record */
+
               (s.member_benefit_plan_end_date IS NULL
                OR s.member_benefit_plan_end_date > s.member_benefit_plan_start_date)
 
@@ -209,7 +203,6 @@ BEGIN
 
           AND (@plan_filter IS NULL OR @plan_list LIKE '%,' + s.benefit_plan_identifier + ',%')
 
-              /* the filter that makes this one partner's file */
           AND (@network_scope IS NULL
                OR @network_list LIKE '%,' + p.supplier_network_identifier + ',%')
 
@@ -218,7 +211,6 @@ BEGIN
 
           AND (@excl_deceased <> 'Y' OR m.death_date IS NULL)
 
-              /* source is mixed case, so compare upper */
           AND (@excl_newborn <> 'Y' OR UPPER(ISNULL(nb.attribute_value,'FALSE')) <> 'TRUE')
 
           AND (@excl_duplicate <> 'Y' OR UPPER(ISNULL(dup.attribute_value,'FALSE')) <> 'TRUE')
@@ -245,7 +237,6 @@ BEGIN
                OR (@wellrec_county_exc IS NOT NULL
                    AND @wrexc_list LIKE '%,' + a.county_2char_code + ',%'))
 
-              /* Y all, N none, O only direct members */
           AND (@direct_members = 'Y'
                OR (@direct_members = 'N'
                    AND pcp.member_identifier IS NOT NULL
@@ -254,16 +245,15 @@ BEGIN
                    AND (pcp.member_identifier IS NULL
                         OR pcp.supplier_location_identifier LIKE 'Pseudo%')));
 
-        SET @rows = @@ROWCOUNT;
-        EXEC ctl.usp_run_finish @run, @rows;
+        DELETE FROM #pop WHERE rk > 1;
 
         IF @span_policy = 'MOST_RECENT_SPAN'
             DELETE FROM #pop WHERE rn > 1;
 
+        SET @rows = (SELECT COUNT(*) FROM #pop);
+        EXEC ctl.usp_run_finish @run, @rows;
+
         CREATE CLUSTERED INDEX ix_pop ON #pop (member_identifier);
-
-
-        /* ---- stage 2, pub.member_benefit_plan_span ---- */
 
         EXEC ctl.usp_run_start 'pub.member_benefit_plan_span', @reference_date, @feed_code, @run OUTPUT;
 
@@ -288,7 +278,7 @@ BEGIN
              source_member_version_key, insert_batch_id)
         SELECT  @reference_date, @feed_code, x.member_identifier, x.benefit_plan_identifier,
                 x.pub_start_date,
-                DATEADD(day, -1, x.pub_end_date),          -- exclusive becomes inclusive, once, here
+                DATEADD(day, -1, x.pub_end_date),
                 'A',
                 m.medicare_status_code, @maintenance_type,
                 cin.identification_number,
@@ -335,7 +325,6 @@ BEGIN
                AND mail.address_type_name = 'Correspondence Override'
                AND mail.address_type      = ''
 
-        /* PER04 takes one number, home first then mobile then work */
         LEFT JOIN (SELECT member_identifier, phone_area_code, phone_number,
                           rn = ROW_NUMBER() OVER (PARTITION BY member_identifier
                                  ORDER BY CASE phone_type_name
@@ -352,9 +341,6 @@ BEGIN
 
         SET @rows = @@ROWCOUNT;
         EXEC ctl.usp_run_finish @run, @rows;
-
-
-        /* ---- stage 3, pub.member_language. 6 is written, 7 is spoken, per Nelson 9/20. ---- */
 
         EXEC ctl.usp_run_start 'pub.member_language', @reference_date, @feed_code, @run OUTPUT;
 
@@ -384,9 +370,6 @@ BEGIN
         SET @rows = @@ROWCOUNT;
         EXEC ctl.usp_run_finish @run, @rows;
 
-
-        /* ---- stage 4, pub.member_other_insurance. 2320 repeats at most 5 times, CG p18, TR3 p164. ---- */
-
         EXEC ctl.usp_run_start 'pub.member_other_insurance', @reference_date, @feed_code, @run OUTPUT;
 
         INSERT pub.member_other_insurance WITH (TABLOCK)
@@ -414,7 +397,6 @@ BEGIN
         SET @rows = @@ROWCOUNT;
         EXEC ctl.usp_run_finish @run, @rows;
 
-        /* the count has to equal the loops published, or it lies */
         UPDATE  s
         SET     s.cob_carrier_count = c.n
         FROM    pub.member_benefit_plan_span s
