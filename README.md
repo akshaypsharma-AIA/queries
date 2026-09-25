@@ -1,8 +1,9 @@
 USE [ODM];
-UPDATE cfg.publication_feed SET eligibility_date_source = 'Hosp' WHERE feed_code = 'NORTHBAY_M';
-GO
-EXEC pub.usp_publish_feed @reference_date = '2026-09-01', @feed_code = 'NORTHBAY_M';
-GO
-SELECT rows_published = COUNT(*), members = COUNT(DISTINCT member_identifier)
-FROM   pub.member_benefit_plan_span
-WHERE  reference_date = '2026-09-01' AND feed_code = 'NORTHBAY_M';
+SELECT  p.provider_relationship,
+        p.supplier_network_identifier,
+        members = COUNT(DISTINCT p.member_identifier)
+FROM    odm.enrollment_provider p
+WHERE   p.supplier_network_identifier IS NOT NULL
+GROUP BY p.provider_relationship, p.supplier_network_identifier
+HAVING  COUNT(DISTINCT p.member_identifier) >= 1000
+ORDER BY members DESC;
