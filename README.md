@@ -1,9 +1,4 @@
 USE [ODM];
-SELECT  p.provider_relationship,
-        p.supplier_network_identifier,
-        members = COUNT(DISTINCT p.member_identifier)
-FROM    odm.enrollment_provider p
-WHERE   p.supplier_network_identifier IS NOT NULL
-GROUP BY p.provider_relationship, p.supplier_network_identifier
-HAVING  COUNT(DISTINCT p.member_identifier) >= 1000
-ORDER BY members DESC;
+SELECT name, definition = OBJECT_DEFINITION(object_id)
+FROM   sys.check_constraints
+WHERE  parent_object_id = OBJECT_ID('cfg.publication_feed');
